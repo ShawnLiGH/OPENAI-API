@@ -1,151 +1,163 @@
-# app.py
-import streamlit as st
-import pandas as pd
-from openai import OpenAI
-from docx import Document
-from datetime import datetime
 import io
+import re
+import pandas as pd
+import streamlit as st
 
-# Page config
-st.set_page_config(page_title="Excel Summarizer", page_icon="📊", layout="wide")
+# Optional OpenAI summary
+from openai import OpenAI
 
-# Load API key from Streamlit secrets (secure method)
-try:
-    api_key = st.secrets["OPENAI_API_KEY"]
-except:
-    st.error("⚠️ API key not configured. Please contact administrator.")
-    st.stop()
 
-# Initialize OpenAI client with pre-loaded API key
-client = OpenAI(api_key=api_key)
+st.set_page_config(page_title="Project Total Extractor", layout="wide")
 
-# Title
-st.title("📊 Excel Spreadsheet Summarizer")
-st.markdown("Upload Excel files and get AI-powered summaries")
-
-# Main content
-uploaded_files = st.file_uploader(
-    "Choose Excel files", 
-    type=['xlsx', 'xls'], 
-    accept_multiple_files=True,
-    help="Upload one or more Excel files to analyze"
+st.title("Project Total Extractor (from 'Total for ...' rows)")
+st.write(
+    "Uploads an Excel report, finds rows where Column A contains **'Total for'**, "
+    "extracts the project name, and pulls the total from **Column G**."
 )
 
-def read_excel_file(uploaded_file):
-    """Read an Excel file and return all sheets as a dictionary of DataFrames"""
-    try:
-        excel_file = pd.ExcelFile(uploaded_file)
-        sheets_data = {}
-        for sheet_name in excel_file.sheet_names:
-            sheets_data[sheet_name] = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-        return sheets_data
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        return None
+# -----------------------------
+# Deterministic extraction logic
+# -----------------------------
+TOTAL_FOR_RE = re.compile(r"^\s*Total for\s*(.*)\s*$", re.IGNORECASE)
 
-def prepare_data_for_summary(sheets_data):
-    """Convert Excel data to text format for summarization"""
-    text_content = ""
-    for sheet_name, df in sheets_data.items():
-        text_content += f"\n\n=== Sheet: {sheet_name} ===\n"
-        text_content += f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\n\n"
-        text_content += f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        text_content += "Sample data:\n"
-        text_content += df.head(10).to_string()
-        text_content += "\n\n"
-        if df.select_dtypes(include=['number']).shape[1] > 0:
-            text_content += "Numeric column statistics:\n"
-            text_content += df.describe().to_string()
-    return text_content
+def extract_project_totals(excel_bytes: bytes) -> pd.DataFrame:
+    """
+    Deterministically extract project totals:
+      - Find rows where Column A matches 'Total for ...'
+      - Project Name = text after 'Total for'
+      - Total Amount = Column G (index 6)
+    """
+    # Read with no header, because your file has report text and a header line inside
+    df = pd.read_excel(io.BytesIO(excel_bytes), header=None, engine="openpyxl")
 
-def summarize_with_openai(content, filename):
-    """Use OpenAI to generate a summary of the spreadsheet"""
-    prompt = f"""Please analyze this Excel spreadsheet data from the file '{filename}' and provide a comprehensive summary including:
-    
-1. Overview of the data structure (sheets, columns, row counts)
-2. Key insights and patterns in the data
-3. Notable statistics or trends
-4. Any data quality observations
+    rows = []
+    for _, row in df.iterrows():
+        col_a = row.iloc[0] if len(row) > 0 else None
+        if isinstance(col_a, str):
+            m = TOTAL_FOR_RE.match(col_a)
+            if m:
+                project_name = (m.group(1) or "").strip()
+                total_amount = row.iloc[6] if len(row) > 6 else None  # Column G
+                rows.append({"Project Name": project_name, "Total Amount": total_amount})
 
-Here's the spreadsheet data:
+    out = pd.DataFrame(rows)
 
-{content}
+    # Normalize numeric column (keeps negatives)
+    if not out.empty:
+        out["Total Amount"] = pd.to_numeric(out["Total Amount"], errors="coerce")
+
+    return out
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Project Summary")
+    return output.getvalue()
+
+
+# -----------------------------
+# Optional GPT narrative summary
+# -----------------------------
+GPT_PROMPT = """You are a careful accounting assistant.
+
+You will be given a JSON array of objects with:
+- "Project Name" (string)
+- "Total Amount" (number or null)
+
+Your job:
+1) Produce a short summary for humans.
+2) Return STRICT JSON only that matches the provided schema.
+3) Do not invent values; only use what is provided.
+4) If totals are null, mention they are missing.
 """
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a data analyst expert who provides clear, concise summaries of spreadsheet data."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=2000
+
+GPT_SCHEMA = {
+    "name": "project_total_summary",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "high_level": {"type": "string"},
+            "largest_projects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "project_name": {"type": "string"},
+                        "total_amount": {"type": "number"},
+                    },
+                    "required": ["project_name", "total_amount"],
+                },
+            },
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["high_level", "largest_projects", "notes"],
+    },
+}
+
+def gpt_make_summary(project_df: pd.DataFrame) -> dict:
+    """
+    Optional: creates a consistent narrative summary using temperature=0 and a strict schema.
+    Requires OPENAI_API_KEY configured in Streamlit secrets/environment.
+    """
+    client = OpenAI()  # reads OPENAI_API_KEY from env or Streamlit secrets
+
+    payload = project_df.to_dict(orient="records")
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",   # pick what you have access to
+        temperature=0,
+        input=[
+            {"role": "system", "content": GPT_PROMPT},
+            {"role": "user", "content": f"Data:\n{payload}"},
+        ],
+        response_format={"type": "json_schema", "json_schema": GPT_SCHEMA},
+    )
+    return resp.output_parsed
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
+
+use_gpt = st.toggle("Also generate a short GPT summary (optional)", value=False)
+top_n = st.number_input("For GPT summary: show Top N largest projects", min_value=1, max_value=25, value=5, step=1)
+
+if uploaded:
+    excel_bytes = uploaded.read()
+    summary_df = extract_project_totals(excel_bytes)
+
+    st.subheader("Extracted Project Totals")
+    if summary_df.empty:
+        st.warning("No 'Total for ...' rows found in Column A.")
+    else:
+        st.dataframe(summary_df, use_container_width=True)
+
+        # Download summary as Excel
+        out_bytes = dataframe_to_excel_bytes(summary_df)
+        st.download_button(
+            label="Download Project Summary Excel",
+            data=out_bytes,
+            file_name="Project_Summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        return response.choices[0].message.content
-    except Exception as e:
-        st.error(f"Error with OpenAI API: {e}")
-        return None
 
-def create_summary_document(summary, filename):
-    """Create a Word document with the summary and return as bytes"""
-    doc = Document()
-    doc.add_heading(f'Spreadsheet Summary: {filename}', 0)
-    doc.add_paragraph(f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    doc.add_paragraph('')
-    doc.add_heading('Summary', 1)
-    doc.add_paragraph(summary)
-    
-    # Save to bytes buffer
-    doc_buffer = io.BytesIO()
-    doc.save(doc_buffer)
-    doc_buffer.seek(0)
-    return doc_buffer
+        # Optional GPT summary
+        if use_gpt:
+            st.subheader("GPT Summary (temperature=0, strict JSON)")
+            # Create a trimmed view for "largest projects" selection
+            df_for_gpt = summary_df.dropna(subset=["Total Amount"]).copy()
+            df_for_gpt = df_for_gpt.sort_values("Total Amount", ascending=False).head(int(top_n))
 
-# Process files when button is clicked
-if uploaded_files:
-    if st.button("🚀 Generate Summary", type="primary"):
-        
-        for uploaded_file in uploaded_files:
-            with st.expander(f"📄 Processing: {uploaded_file.name}", expanded=True):
-                # Read Excel file
-                with st.spinner("Reading Excel file..."):
-                    sheets_data = read_excel_file(uploaded_file)
-                
-                if sheets_data:
-                    # Show preview
-                    st.info(f"Found {len(sheets_data)} sheet(s)")
-                    for sheet_name, df in sheets_data.items():
-                        st.write(f"**{sheet_name}**: {df.shape[0]} rows × {df.shape[1]} columns")
-                    
-                    # Prepare data
-                    content = prepare_data_for_summary(sheets_data)
-                    
-                    # Generate summary
-                    with st.spinner("Generating AI summary..."):
-                        summary = summarize_with_openai(content, uploaded_file.name)
-                    
-                    if summary:
-                        # Display summary
-                        st.success("✅ Summary generated!")
-                        st.markdown("### Summary")
-                        st.write(summary)
-                        
-                        # Create downloadable document
-                        doc_buffer = create_summary_document(summary, uploaded_file.name)
-                        output_filename = f"{uploaded_file.name.rsplit('.', 1)[0]}_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-                        
-                        st.download_button(
-                            label="📥 Download Word Document",
-                            data=doc_buffer,
-                            file_name=output_filename,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-                    
-                    st.markdown("---")
-else:
-    st.info("👆 Upload Excel files to get started")
+            try:
+                gpt_json = gpt_make_summary(df_for_gpt)
+                st.json(gpt_json)
+                st.markdown("**High-level:** " + gpt_json["high_level"])
+            except Exception as e:
+                st.error("GPT summary failed. Check your API key / model access.")
+                st.exception(e)
 
-# Footer
-st.markdown("---")
-st.markdown("Built with Streamlit and OpenAI")
+st.caption("Deterministic extraction is used for the spreadsheet logic; GPT is optional for narrative only.")
