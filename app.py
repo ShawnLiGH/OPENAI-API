@@ -95,3 +95,9 @@ if uploaded_file:
             data=excel_out,
             file_name="Project_Summary.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+st.caption(
+    "This tool uses deterministic rules only. "
+    "No AI or external services are involved."
+)
